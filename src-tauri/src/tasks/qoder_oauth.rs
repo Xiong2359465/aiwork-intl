@@ -31,6 +31,31 @@ pub const DEVICE_AUTH_BASE: &str = "https://qoder.cn/device/selectAccounts";
 /// （10router/cockpit-tools）则完全省略该参数，两者均为可行方案。
 pub const DEVICE_AUTH_CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
 
+/// 授权页基址（国际版）：`qoder.com` ↔ 国内 `qoder.cn`
+pub const DEVICE_AUTH_BASE_GLOBAL: &str = "https://qoder.com/device/selectAccounts";
+
+/// 授权页 client_id（国际版官方注册常量，与社区 global 实现一致）。
+/// 两区 client_id 不通用：拿国内常量打国际授权页会被判「参数无效」。
+pub const DEVICE_AUTH_CLIENT_ID_GLOBAL: &str = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb";
+
+/// 按 region 选授权页基址（空/cn → 国内，与升级前行为一致）
+pub fn device_auth_base(region: &str) -> &'static str {
+    if region == "global" {
+        DEVICE_AUTH_BASE_GLOBAL
+    } else {
+        DEVICE_AUTH_BASE
+    }
+}
+
+/// 按 region 选 client_id
+pub fn device_client_id(region: &str) -> &'static str {
+    if region == "global" {
+        DEVICE_AUTH_CLIENT_ID_GLOBAL
+    } else {
+        DEVICE_AUTH_CLIENT_ID
+    }
+}
+
 /// 轮询间隔（抓包实测约 1s）
 pub const POLL_INTERVAL_MS: u64 = 1000;
 /// 轮询超时（180s，覆盖人工在浏览器完成登录的时延）
@@ -48,22 +73,34 @@ pub struct DeviceFlow {
     pub client_id: Option<String>,
     /// 授权页完整 URL（challenge = BASE64URL(SHA256(verifier))，S256）
     pub auth_url: String,
+    /// 站点区域："" | "cn" → 国内，"global" → 国际（决定授权页域、client_id 与轮询域）
+    pub region: String,
 }
 
 impl DeviceFlow {
     /// 常规模式：携带官方注册固定 client_id（与真实客户端跳转逐字一致）
     pub fn new() -> Self {
-        Self::build(true)
+        Self::build(true, "")
+    }
+
+    /// 常规模式 + 指定区域
+    pub fn new_region(region: &str) -> Self {
+        Self::build(true, region)
     }
 
     /// 兼容模式：不带 client_id（2026-10-02 审查预案落地）——官方常量一旦被
     /// Qoder 轮换导致授权页「参数无效」，改用本模式即可恢复（前端在授权超时后
     /// 自动切换到本模式重试）。
     pub fn new_compat() -> Self {
-        Self::build(false)
+        Self::build(false, "")
     }
 
-    fn build(with_client_id: bool) -> Self {
+    /// 兼容模式 + 指定区域
+    pub fn new_compat_region(region: &str) -> Self {
+        Self::build(false, region)
+    }
+
+    fn build(with_client_id: bool, region: &str) -> Self {
         // verifier：双 uuid v4 拼接 = 64 hex 字符（抓包样本同为 64 字符长度量级）
         let verifier = format!(
             "{}{}",
@@ -72,18 +109,19 @@ impl DeviceFlow {
         );
         let nonce = uuid::Uuid::new_v4().to_string();
         let machine_id = uuid::Uuid::new_v4().to_string();
-        // client_id：官方注册固定常量（随机生成会被授权页判「参数无效」）
-        let client_id = with_client_id.then(|| DEVICE_AUTH_CLIENT_ID.to_string());
+        // client_id：官方注册固定常量（随机生成会被授权页判「参数无效」），按区取值
+        let client_id = with_client_id.then(|| device_client_id(region).to_string());
+        let auth_base = device_auth_base(region);
         // challenge：BASE64URL_NO_PAD(SHA256(verifier))（PKCE S256）
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         let mut url = format!(
-            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
+            "{auth_base}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
         );
         if let Some(cid) = &client_id {
             url.push_str(&format!("&client_id={cid}"));
         }
-        Self { nonce, verifier, machine_id, client_id, auth_url: url }
+        Self { nonce, verifier, machine_id, client_id, auth_url: url, region: region.to_string() }
     }
 }
 
@@ -98,7 +136,7 @@ impl Default for DeviceFlow {
 pub fn poll_once(agent: &ureq::Agent, flow: &DeviceFlow) -> (u16, Option<Value>) {
     let url = format!(
         "{}/api/v1/deviceToken/poll?nonce={}&verifier={}&challenge_method=S256",
-        qoder_common::OPEN_API_BASE,
+        qoder_common::openapi_base(&flow.region),
         flow.nonce,
         urlencode(&flow.verifier)
     );

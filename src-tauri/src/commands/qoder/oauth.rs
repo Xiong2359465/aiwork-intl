@@ -80,16 +80,24 @@ fn emit_done(app: &AppHandle, data_dir: &Path, ok: bool, id: &str, nickname: &st
 /// 验证可用）。官方常量被 Qoder 轮换导致授权页「参数无效」时，前端在授权超时后
 /// 自动改用本模式重试。
 #[tauri::command(async)]
-pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<bool>) -> Result<(), String> {
+pub fn qoder_oauth_login(
+    app: AppHandle,
+    state: State<AppState>,
+    compat: Option<bool>,
+    region: Option<String>,
+) -> Result<(), String> {
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 登录在执行中，请等待完成".into());
     }
     // 复位取消标志（上一轮会话的取消请求不应影响本次登录）
     OAUTH_CANCEL.store(false, Ordering::SeqCst);
+    // region："" | "cn" → 国内授权页，"global" → 国际页（qoder.com + 另一套
+    // client_id + openapi.qoder.sh 轮询域），随 flow 一路带到凭证落库
+    let region = region.unwrap_or_default();
     let flow = if compat.unwrap_or(false) {
-        qoder_oauth::DeviceFlow::new_compat()
+        qoder_oauth::DeviceFlow::new_compat_region(&region)
     } else {
-        qoder_oauth::DeviceFlow::new()
+        qoder_oauth::DeviceFlow::new_region(&region)
     };
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 授权页…", Some(&auth_url));
@@ -143,10 +151,13 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
                         };
                         // nonce 回验（审查 L）：响应必须属于本次会话，防 poll 响应
                         // 被替换为其他会话的授权结果
-                        let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b, &flow.nonce) else {
+                        let Some((mut creds, uid)) = qoder_oauth::parse_poll_success(&b, &flow.nonce) else {
                             emit_done(&app2, &state2.data_dir, false, "", "", "授权响应校验失败（nonce 不匹配或缺少令牌字段），请重试");
                             return;
                         };
+                        // 区域随凭证落库：后续 userinfo/plan/签到/额度全部按此选域，
+                        // 国际版令牌打国内域只会 401
+                        creds.region = flow.region.clone();
                         // 导入阶段进度事件（审查 P3）：import_device_creds 含网络请求
                         //（userinfo/plan 拉取）与 vault 落库，慢网下 30s+ 无事件会被
                         // 用户当作卡死而反复重试/取消——先报「已授权」再导入
@@ -225,6 +236,7 @@ fn import_device_creds(
     let probe = qoder_common::QoderCreds {
         access_token: creds.access_token.clone(),
         kind: "client".into(),
+        region: creds.region.clone(),
         ..Default::default()
     };
     let (info_uid, nickname) = qoder_common::fetch_userinfo(&agent, &probe);
@@ -269,6 +281,8 @@ fn import_device_creds(
             }
             a.needs_relogin = false;
             a.relogin_reason = String::new();
+            // 区域以本次凭证为准：令牌只能在其签发站点工作
+            a.region = creds.region.clone();
             // 指纹回填（幂等：已有稳定绑定不覆盖，§5.10）
             if a.device_profile.is_none() {
                 a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
@@ -281,6 +295,7 @@ fn import_device_creds(
                 nickname: display.clone(),
                 plan: tier,
                 credential_source: "client".into(),
+                region: creds.region.clone(),
                 // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
                 device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
                 ..Default::default()

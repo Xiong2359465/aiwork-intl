@@ -46,6 +46,73 @@ impl QoderDeviceProfile {
     }
 }
 
+// ── 国际版：账号绑定的稳定设备标识派生 ──────────────────────────────────────
+
+/// 派生出的设备标识四键，形态对齐国际版客户端实测头：
+/// machine_id 32 hex / machine_code 18 hex / machine_type 17 hex /
+/// machine_token 43 位 base64url。
+#[derive(Clone, Default, Debug)]
+pub struct DerivedDeviceIdentity {
+    pub machine_id: String,
+    pub machine_code: String,
+    pub machine_type: String,
+    pub machine_token: String,
+}
+
+/// 派生种子：优先账号 uid，uid 未知时回退凭证——同一凭证跨调用结果恒定，
+/// 不随进程重启漂移（漂移即换设备，等价触发风控）
+pub fn fingerprint_seed(uid: &str, credential: &str) -> String {
+    if !uid.is_empty() {
+        uid.to_string()
+    } else {
+        format!("cred:{credential}")
+    }
+}
+
+fn md5_hex(input: &str) -> String {
+    use md5::{Digest as _, Md5};
+    let mut h = Md5::new();
+    h.update(input.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 按账号派生设备标识。
+///
+/// `device_profile.machine_id`（入池生成一次、永不轮换）在此充当**该账号自持的
+/// 私有盐**，与 uid/凭证一起参与单向派生。多开意义上的两个不变量：
+/// ① 同一账号长期表现为同一台虚拟设备（机器码不漂移）；
+/// ② 不同账号彼此落在不同桶里，跨账号无共同机器标识（防关联判定）。
+/// 盐只存在本地账号记录内，故外部即便知道 uid 也推不出指纹——纯 uid 派生
+/// 正是这个缺陷（上游一旦识别派生模式可全局拉黑）。
+///
+/// 规则与 qoder2api `internal/cosy/fingerprint.go` 同构（machine / machinetype /
+/// machinetoken 三标签 + 盐混入），并额外派生 machinecode 以补齐国际版要求的
+/// 全部设备头（缺任一 cosy-machine* 头，服务端不下发签到活动）。
+pub fn derive_device_identity(
+    profile: &QoderDeviceProfile,
+    uid: &str,
+    credential: &str,
+) -> DerivedDeviceIdentity {
+    let base = fingerprint_seed(uid, credential);
+    let seed = if profile.machine_id.is_empty() {
+        base
+    } else {
+        format!("{base}|salt:{}", profile.machine_id)
+    };
+    let mut sha = <sha2::Sha512 as sha2::Digest>::new();
+    sha.update(format!("machinetoken:{seed}").as_bytes());
+    let token_enc = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha.finalize())
+    };
+    DerivedDeviceIdentity {
+        machine_id: md5_hex(&format!("machine:{seed}")),
+        machine_code: md5_hex(&format!("machinecode:{seed}"))[..18].to_string(),
+        machine_type: md5_hex(&format!("machinetype:{seed}"))[..17].to_string(),
+        machine_token: token_enc[..43.min(token_enc.len())].to_string(),
+    }
+}
+
 /// machine_id 生成：sha256(uuid4)[..32] —— 32 位小写 hex，与 QoderPatcher 的
 /// md5(随机数) 同格式且熵更高（归档 §6.1 翻译建议）
 pub fn machine_id_generate() -> String {
@@ -179,5 +246,100 @@ mod tests {
         let empty = QoderDeviceProfile::default();
         merge_device_profile(&mut creds, Some(&empty));
         assert!(creds.machine_id.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod derive_identity_tests {
+    use super::*;
+
+    fn profile_with(mid: &str) -> QoderDeviceProfile {
+        QoderDeviceProfile {
+            machine_id: mid.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 无盐（profile.machine_id 为空）时与 hub / qoder2api 的派生逐字节同构：
+    /// md5("machine:{uid}") / md5("machinecode:{uid}")[:18] /
+    /// md5("machinetype:{uid}")[:17] / b64url_nopad(sha512("machinetoken:{uid}"))[:43]。
+    /// 期望值由独立实现（Python hashlib + base64）离线算出并硬编码于此。
+    #[test]
+    fn derive_matches_reference_vectors_without_salt() {
+        let d = derive_device_identity(&profile_with(""), "u-test", "dt-irrelevant");
+        assert_eq!(d.machine_id, "ca0bfb324ea94332ad402d6311455a3b");
+        assert_eq!(d.machine_code, "7bb731df9a7417fcde");
+        assert_eq!(d.machine_type, "73bcf1fc641e54a50");
+        assert_eq!(d.machine_token, "8H5OX8u_I9jcPcyUWJLzxhbhqf7cS3nYofUl0Um4E3p");
+    }
+
+    /// 形态红线：32/18/17 hex 小写 + 43 位 base64url，与真机抓包同形
+    /// （长度或字符集不对，一眼就是自造设备）
+    #[test]
+    fn derived_shape_looks_like_real_client() {
+        let p = QoderDeviceProfile::generate();
+        let d = derive_device_identity(&p, "u-any", "dt-x");
+        assert_eq!(d.machine_id.len(), 32);
+        assert_eq!(d.machine_code.len(), 18);
+        assert_eq!(d.machine_type.len(), 17);
+        assert_eq!(d.machine_token.len(), 43);
+        for s in [&d.machine_id, &d.machine_code, &d.machine_type] {
+            assert!(
+                s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+                "非小写 hex: {s}"
+            );
+        }
+        assert!(d
+            .machine_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    /// 同账号 + 同 profile：跨调用恒定（换值 = 换设备 = 触发风控）
+    #[test]
+    fn same_account_is_stable_across_calls() {
+        let p = profile_with("b".repeat(32).as_str());
+        let a = derive_device_identity(&p, "uid-1", "dt-1");
+        let b = derive_device_identity(&p, "uid-1", "dt-1");
+        assert_eq!(a.machine_id, b.machine_id);
+        assert_eq!(a.machine_code, b.machine_code);
+        assert_eq!(a.machine_type, b.machine_type);
+        assert_eq!(a.machine_token, b.machine_token);
+    }
+
+    /// 多开核心不变量：uid 不同 或 账号私有盐不同 → 四键全不同，
+    /// 同机多账号在外部分属不同设备，无共享标识可供关联
+    #[test]
+    fn accounts_are_mutually_distinct() {
+        let p1 = profile_with("a".repeat(32).as_str());
+        let p2 = profile_with("b".repeat(32).as_str());
+        let d1 = derive_device_identity(&p1, "uid-1", "dt-1");
+        let d2 = derive_device_identity(&p1, "uid-2", "dt-2");
+        let d3 = derive_device_identity(&p2, "uid-1", "dt-1");
+        assert_ne!(d1.machine_id, d2.machine_id);
+        assert_ne!(d1.machine_id, d3.machine_id);
+        assert_ne!(d1.machine_token, d3.machine_token);
+    }
+
+    /// uid 未知时以凭证为种子：同一凭证重导入得到同一指纹（不因导入次数漂移），
+    /// 不同凭证彼此不同
+    #[test]
+    fn credential_fallback_is_deterministic() {
+        let p = profile_with("c".repeat(32).as_str());
+        let a = derive_device_identity(&p, "", "dt-same");
+        let b = derive_device_identity(&p, "", "dt-same");
+        let c = derive_device_identity(&p, "", "dt-other");
+        assert_eq!(a.machine_id, b.machine_id);
+        assert_ne!(a.machine_id, c.machine_id);
+    }
+
+    /// 带账号私有盐（真实入池形态）时不再等于纯 uid 派生值——防「知道 uid 即可
+    /// 反推指纹」，也与其它部署的派生空间隔离
+    #[test]
+    fn per_account_salt_moves_identity_off_plain_uid_space() {
+        let plain = derive_device_identity(&profile_with(""), "u-test", "dt-x");
+        let salted = derive_device_identity(&profile_with(&"a".repeat(32)), "u-test", "dt-x");
+        assert_eq!(salted.machine_id, "b998bd1e9f03aa271fb52bcea375f7ea");
+        assert_ne!(plain.machine_id, salted.machine_id);
     }
 }

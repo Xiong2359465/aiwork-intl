@@ -22,6 +22,8 @@ pub struct QoderAccountView {
     pub phone_masked: String,
     pub plan: String,
     pub credential_source: String,
+    /// 站点区域："" | "cn" → 国内版，"global" → 国际版（决定所有出站域名）
+    pub region: String,
     pub token_expires_at: Option<i64>,
     pub needs_relogin: bool,
     pub relogin_reason: String,
@@ -72,6 +74,7 @@ fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountV
         phone_masked: a.phone_masked.clone(),
         plan: a.plan.clone(),
         credential_source: a.credential_source.clone(),
+        region: a.region.clone(),
         token_expires_at: a.token_expires_at,
         needs_relogin: a.needs_relogin,
         relogin_reason: a.relogin_reason.clone(),
@@ -246,23 +249,29 @@ pub async fn qoder_account_import_pat(
     state: State<'_, AppState>,
     name: Option<String>,
     pat: String,
+    region: Option<String>,
 ) -> Result<QoderAccountView, String> {
     let pat = pat.trim().to_string();
     if pat.is_empty() {
         return Err("PAT 不能为空".into());
     }
+    // 站点区域："" | "cn" → 国内（qoder.cn 签发的 PAT），"global" → 国际
+    // （qoder.com 签发）。PAT 只在签发站点可用，跨区换取作业令牌恒 401
+    let region = region.unwrap_or_default();
     if !pat.starts_with("pt-") && !pat.starts_with("jt-") {
-        return Err("凭证格式不识别：应为 qoder.com.cn/account/integrations 创建的 PAT（pt-）或客户端抓包获取的 job token（jt-）".into());
+        return Err("凭证格式不识别：应为站点 /account/integrations 创建的 PAT（pt-）或客户端抓包获取的 job token（jt-）；国内版取自 qoder.cn，国际版取自 qoder.com".into());
     }
     let id = account_id_of(&pat);
     // spawn_blocking：fetch_userinfo/fetch_plan 为阻塞 ureq 网络请求（15s 超时），
     // async 命令体内直接执行会占用 async worker 线程
     let pat2 = pat.clone();
+    let region2 = region.clone();
     let (uid, nickname, plan) = tauri::async_runtime::spawn_blocking(move || {
         let agent = crate::tasks::http_agent(15);
         let creds = QoderCreds {
             access_token: pat2,
             kind: "pat".into(),
+            region: region2,
             ..Default::default()
         };
         let (uid, nickname) = qoder_common::fetch_userinfo(&agent, &creds);
@@ -313,6 +322,8 @@ pub async fn qoder_account_import_pat(
                 }
                 a.needs_relogin = false;
                 a.relogin_reason = String::new();
+                // 区域以本次导入为准（PAT 只在签发站点可用）
+                a.region = region.clone();
                 // 指纹回填（幂等：已有稳定绑定不覆盖，§5.10）
                 if a.device_profile.is_none() {
                     a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
@@ -326,6 +337,7 @@ pub async fn qoder_account_import_pat(
                         .unwrap_or_else(|| format!("Qoder {}", &id2[3..9])),
                     plan,
                     credential_source: "pat".into(),
+                    region: region.clone(),
                     // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
                     device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
                     ..Default::default()
@@ -343,6 +355,7 @@ pub async fn qoder_account_import_pat(
             kind: "pat".into(),
             uid: uid.clone(),
             nickname: nickname.clone(),
+            region: region.clone(),
             ..Default::default()
         };
         // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——

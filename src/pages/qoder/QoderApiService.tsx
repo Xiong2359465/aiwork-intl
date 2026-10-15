@@ -785,9 +785,12 @@ export default function QoderApiService() {
             {/* F-80-余 v2 Global 区标记说明：当前仅接入 CN 区（国内版）上游 */}
             <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:border-zinc-800 dark:bg-zinc-800/40 dark:text-zinc-400">
               <span className="font-medium text-slate-600 dark:text-zinc-300">地区说明：</span>
-              当前仅接入 <span className="font-medium">CN 区（国内版）</span> 网关
-              （gateway.qoder.com.cn）。Global 区（api3.qoder.sh，海外版）尚未接线：
+              当前仅接入 <span className="font-medium">CN 区（国内版）</span> 推理网关
+              （gateway.qoder.com.cn）。Global 区（api3.qoder.sh，海外版）推理上游尚未接线：
               Global 专属模型仅目录可见、不可路由，请求将显式返回 404。
+              <br />
+              注：国际版账号的入池（OAuth 设备流 / PAT）、每日签到、积分与额度查询已按账号
+              区域走 openapi.qoder.sh / qoder.com，不受本条限制。
             </div>
           </div>
         </div>

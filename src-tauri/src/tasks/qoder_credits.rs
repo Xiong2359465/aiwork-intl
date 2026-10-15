@@ -392,8 +392,12 @@ fn parse_big_model(b: &Value, plan_expires_at: &str) -> BigModelParsed {
 }
 
 /// 当前余额（签到奖励差值兜底数据源）：plan + addon remaining 之和；失败 None。
-pub fn fetch_usage_balance(agent: &ureq::Agent, headers: &[(String, String)]) -> Option<f64> {
-    let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
+pub fn fetch_usage_balance(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    region: &str,
+) -> Option<f64> {
+    let url = format!("{}/sash/api/v2/me/usage", qoder_common::openapi_base(region));
     let (status, body, _raw) = qoder_common::get_json(agent, &url, headers);
     if status != 200 {
         return None;
@@ -439,7 +443,7 @@ fn fetch_account(
         return row;
     }
     let headers = qoder_common::build_auth_headers(&creds);
-    let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
+    let url = format!("{}/sash/api/v2/me/usage", qoder_common::openapi_base(&creds.region));
     let (status, body, _raw) = qoder_common::get_json(agent, &url, &headers);
     if status != 200 {
         // P3：结构化状态码随行——401 自愈判定不再依赖 message 文本匹配（message
@@ -484,7 +488,10 @@ fn fetch_account(
     let mut tried: Vec<String> = Vec::new();
     let fail_cached = per_pack_fail_hit(&aid);
     if !fail_cached {
-        for host in [qoder_common::WEB_BASE, qoder_common::OPEN_API_BASE] {
+        for host in [
+            qoder_common::web_base(&creds.region),
+            qoder_common::openapi_base(&creds.region),
+        ] {
             let big_url = format!("{host}/api/v2/me/usages/big_model_credits");
             let (bs, bb, _) = qoder_common::get_json(agent, &big_url, &headers);
             if bs == 200 {

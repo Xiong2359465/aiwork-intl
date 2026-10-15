@@ -59,12 +59,15 @@ pub(crate) fn try_acquire_qoder_round() -> Result<tokio::sync::MutexGuard<'stati
 // ── 端点表（R-4/R-7 抓包固化；常量集中可改）────────────────────────────────
 
 struct QoderUrls {
+    /// 该账号区域的 OpenAPI 基址（两区路径同构，仅主机不同）
+    base: String,
     campaigns: String,
 }
 
-fn urls_for() -> QoderUrls {
-    let b = qoder_common::OPEN_API_BASE;
+fn urls_for(region: &str) -> QoderUrls {
+    let b = qoder_common::openapi_base(region);
     QoderUrls {
+        base: b.to_string(),
         campaigns: format!("{b}/sash/api/v1/me/campaigns"),
     }
 }
@@ -370,11 +373,7 @@ fn claim_one(
         .get("benefit")
         .and_then(|x| x.get("amount"))
         .and_then(|v| num_or_none(Some(v)));
-    let url = format!(
-        "{}/sash/api/v1/me/campaigns/{}/claim",
-        qoder_common::OPEN_API_BASE,
-        campaign_id
-    );
+    let url = format!("{}/sash/api/v1/me/campaigns/{}/claim", urls.base, campaign_id);
     jitter_sleep();
     let (status, body, raw) = post_empty(agent, &url, headers);
     if status == 401 {
@@ -677,6 +676,19 @@ fn minimal_auth_headers(access_token: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// 签到请求头的区域口径：
+/// - 国内版：客户端完整形态（含本机原生设备三键，服务端按真值分桶）
+/// - 国际版：最小头。实测 machineid / machinetype / machinecode / hostname / os
+///   均不影响活动下发，而携带自造 `cosy-machinetoken` 反而会被上游判为伪造设备
+///  （与 qoder2api 同结论，见其 checkinHeaders 注释）
+fn checkin_headers(creds: &qoder_common::QoderCreds) -> Vec<(String, String)> {
+    if creds.region == "global" {
+        minimal_auth_headers(&creds.access_token)
+    } else {
+        qoder_common::build_auth_headers(creds)
+    }
+}
+
 /// Unix 秒 → "MM-DD HH:MM"（CST）诊断展示（窗口起止用；解析失败给空串）。
 fn cst_hhmm(secs: i64) -> String {
     use chrono::TimeZone;
@@ -945,6 +957,7 @@ impl BlindRound {
 fn blind_round(
     agent: &ureq::Agent,
     headers: &[(String, String)],
+    urls: &QoderUrls,
     candidates: &[(String, String)],
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
@@ -965,10 +978,7 @@ fn blind_round(
         {
             continue;
         }
-        let url = format!(
-            "{}/sash/api/v1/me/campaigns/{cid}/claim",
-            qoder_common::OPEN_API_BASE
-        );
+        let url = format!("{}/sash/api/v1/me/campaigns/{cid}/claim", urls.base);
         jitter_sleep();
         let (status, body, raw) = post_empty(agent, &url, headers);
         let claimed = body
@@ -1054,7 +1064,7 @@ fn known_daily_fallback(
         }
     }
     let tried: Vec<String> = candidates.iter().map(|(cid, _)| cid.clone()).collect();
-    let first = blind_round(agent, headers, &candidates, learned, table);
+    let first = blind_round(agent, headers, urls, &candidates, learned, table);
     // 401 中断：上报 Auth 走账号级凭证刷新自愈（已累计 reward 随行，不重学不重试）
     if first.auth {
         return FallbackOutcome::Auth(first.reward);
@@ -1074,7 +1084,7 @@ fn known_daily_fallback(
     }
     // 重学结果入共享池（跨账号复用；若重试轮再 409 会被 blind_round 剔除）
     merge_learned(learned, retry.clone());
-    let second = blind_round(agent, headers, &retry, learned, table);
+    let second = blind_round(agent, headers, urls, &retry, learned, table);
     let merged = first.merge(second);
     if merged.auth {
         return FallbackOutcome::Auth(merged.reward);
@@ -1172,7 +1182,10 @@ fn process_account(
     if note == "pat_rejected" {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
                        "fail_kind": PERMANENT_AUTH_TAG,
-                       "message": "PAT 校验失败（无效或已吊销）：请到 qoder.com.cn/account/integrations 重新创建并导入" });
+                       "message": format!(
+                           "PAT 校验失败（无效或已吊销）：请到 {}account/integrations 重新创建并导入",
+                           qoder_common::web_base(&creds.region)
+                       ) });
     }
     // 前置拦截（审查 L）：凭证已过期且无刷新令牌（expired_needs_relogin）时，本轮
     // 请求与 401 自愈都注定失败——直接 fail 跳过，省一次必败网络请求
@@ -1191,13 +1204,13 @@ fn process_account(
     if refreshed {
         qoder_common::sync_pool_expiry(state, &aid, &creds);
     }
-    let urls = urls_for();
-    let mut headers = qoder_common::build_auth_headers(&creds);
+    let urls = urls_for(&creds.region);
+    let mut headers = checkin_headers(&creds);
     // 逐活动明细（F-80-余 v2 档期日历数据源）：auth 401 重试路径继续累计
     let mut campaigns_detail: Option<Vec<Value>> = None;
     // 签到前余额（差值兜底数据源；查询失败不阻塞签到。共享 qoder_credits 解析，
     // 端点 R-7 固化为 GET /sash/api/v2/me/usage）
-    let pre_balance = super::qoder_credits::fetch_usage_balance(agent, &headers);
+    let pre_balance = super::qoder_credits::fetch_usage_balance(agent, &headers, &creds.region);
     // 本轮成功领取的活动是否全部为 CREDITS（审查修复：非积分奖励如 BOGO 到账不
     // 体现为余额增长，不能凭「余额未动」判未到账——仅全 CREDITS 时才启用降级；
     // 盲发兜底候选口径强制 CREDITS，天然保持 true）
@@ -1329,7 +1342,7 @@ fn process_account(
         match retry_cred {
             Some(new) => {
                 qoder_common::sync_pool_expiry(state, &aid, &new);
-                headers = qoder_common::build_auth_headers(&new);
+                headers = checkin_headers(&new);
                 // 最小头学习令牌随刷新同步更新（PR #106：重试路径的补学须用新令牌，
                 // 旧令牌已被一次性轮换作废，用旧令牌补学必 401）
                 min_token = new.access_token.clone();
@@ -1468,7 +1481,9 @@ fn process_account(
         let mut arrived = false;
         for _attempt in 0..3 {
             jitter_sleep();
-            let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
+            let Some(post) =
+                super::qoder_credits::fetch_usage_balance(agent, &headers, &creds.region)
+            else {
                 continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
             };
             let Some(pre) = pre_balance else { break; };
@@ -1748,9 +1763,21 @@ mod tests {
 
     #[test]
     fn urls_cover_sash_endpoints() {
-        let u = urls_for();
-        assert!(u.campaigns.starts_with(qoder_common::OPEN_API_BASE));
-        assert!(u.campaigns.contains("/sash/api/v1/me/campaigns"));
+        let cn = urls_for("cn");
+        assert!(cn.campaigns.starts_with(qoder_common::OPEN_API_BASE));
+        assert!(cn.campaigns.contains("/sash/api/v1/me/campaigns"));
+        // 空 region 必须回落到国内域：存量账号没有该字段，行为不得变
+        assert_eq!(urls_for("").base, cn.base);
+        // 国际版只换主机、不换路径
+        let gl = urls_for("global");
+        assert!(gl.campaigns.starts_with(qoder_common::OPEN_API_BASE_GLOBAL));
+        assert_eq!(
+            gl.campaigns,
+            format!(
+                "{}/sash/api/v1/me/campaigns",
+                qoder_common::OPEN_API_BASE_GLOBAL
+            )
+        );
     }
 
     /// 兜底常量表 campaignId 路径安全（与 claim_one 同白名单 [A-Za-z0-9_-]）：
@@ -2245,7 +2272,6 @@ mod tests {
     fn probe_sash_campaigns_headers() {
         let state = crate::state::AppState::new().expect("构造 AppState 失败");
         let agent = crate::tasks::http_agent(30);
-        let urls = urls_for();
         let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
         let accounts = pool
             .get("accounts")
@@ -2261,6 +2287,8 @@ mod tests {
                 println!("  <无可用凭证（vault 被锁或池空），跳过>");
                 continue;
             }
+            // 端点按账号区域取：国际版账号打国内域只会得到 401，探针必须跟着区域走
+            let urls = urls_for(&creds.region);
             println!(
                 "  stored_uid = {}, token_prefix = {}, machine_id = {}, has_machine_token = {}",
                 creds.uid,
@@ -2281,10 +2309,7 @@ mod tests {
             // 已领账号应回放 replayed:true；列表不可见账号若 200+CLAIMED 证明 claim
             // 不受列表过滤约束（兜底直领可行），4xx 则锁定错误体形态
             let (cid, _cname) = KNOWN_DAILY_CAMPAIGNS[0];
-            let c_url = format!(
-                "{}/sash/api/v1/me/campaigns/{cid}/claim",
-                qoder_common::OPEN_API_BASE
-            );
+            let c_url = format!("{}/sash/api/v1/me/campaigns/{cid}/claim", urls.base);
             std::thread::sleep(std::time::Duration::from_millis(1500));
             let (st3, body3, raw3) =
                 post_empty(&agent, &c_url, &qoder_common::build_auth_headers(&creds));

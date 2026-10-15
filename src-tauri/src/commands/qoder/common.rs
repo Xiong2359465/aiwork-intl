@@ -24,6 +24,11 @@ pub struct QoderAccount {
     /// 全家桶 uid（/api/v1/userinfo 回填；PAT 导入时 userinfo 失败可空）
     #[serde(default)]
     pub uid: String,
+    /// 站点区域："" | "cn" → 国内（qoder.cn / openapi.qoder.com.cn），
+    /// "global" → 国际（qoder.com / openapi.qoder.sh）。两区账号体系互不通用，
+    /// 所有出站请求的域名与 client_id 都按此选择；存量账号无该字段即国内，行为不变
+    #[serde(default)]
+    pub region: String,
     #[serde(default)]
     pub nickname: String,
     /// 手机号掩码（userinfo 未提供时留空，M1 不做猜测）

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/export-accounts-json
+      - feat/qoder-intl-region
   workflow_dispatch:
 
 jobs:

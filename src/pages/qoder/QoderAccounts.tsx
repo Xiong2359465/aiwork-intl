@@ -152,6 +152,10 @@ export default function QoderAccounts() {
   // 池来源徽标（需求①可选增强）：groupId → 在哪些池有成员
   const [poolBadges, setPoolBadges] = useState<Record<string, string[]>>({});
   const [filter, setFilter] = useState('all');
+  // 新增账号的目标站点：cn = 国内版（qoder.cn / openapi.qoder.com.cn），
+  // global = 国际版（qoder.com / openapi.qoder.sh）。两区账号体系不互通，
+  // OAuth 授权页与 client_id、PAT 换取端点、签到/额度域名全部按此分流
+  const [addRegion, setAddRegion] = useState<'cn' | 'global'>('cn');
   // PAT 导入弹框
   const [showImport, setShowImport] = useState(false);
   const [patName, setPatName] = useState('');
@@ -425,7 +429,7 @@ export default function QoderAccounts() {
     setOauthUrl(null);
     setShowOauth(true);
     try {
-      await api.qoder.oauthLogin(compat);
+      await api.qoder.oauthLogin(compat, addRegion);
     } catch (err) {
       setOauthRunning(false);
       setOauthCanceling(false);
@@ -492,7 +496,7 @@ export default function QoderAccounts() {
     }
     setImporting(true);
     try {
-      const v = await api.qoder.accountImportPat(patName.trim() || undefined, token);
+      const v = await api.qoder.accountImportPat(patName.trim() || undefined, token, addRegion);
       pushToast('success', `账号已导入：${v.nickname || v.id}`);
       closeImport();
       void refresh();
@@ -785,6 +789,15 @@ export default function QoderAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
+            <select
+              className="btn-outline !py-1.5"
+              value={addRegion}
+              onChange={(e) => setAddRegion(e.target.value as 'cn' | 'global')}
+              title="新增账号所属站点：国内版（qoder.cn）与国际版（qoder.com）账号体系不互通，OAuth 授权页、client_id、签到与额度域名按此分流"
+            >
+              <option value="cn">国内版</option>
+              <option value="global">国际版</option>
+            </select>
             <button
               className="btn-outline"
               disabled={oauthRunning}
@@ -924,6 +937,7 @@ export default function QoderAccounts() {
                   <th className="px-4 py-2 text-left">标签</th>
                   <th className="px-4 py-2 text-left">套餐</th>
                   <th className="px-4 py-2 text-left">凭证来源</th>
+                  <th className="px-4 py-2 text-left">站点</th>
                   <th className="px-4 py-2 text-left">Token 状态</th>
                   <th className="px-4 py-2 text-left">设备指纹</th>
                   <th className="px-4 py-2 text-right">积分余额</th>
@@ -980,6 +994,18 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3">
                       <Badge tone={a.credential_source === 'pat' ? 'green' : 'slate'}>
                         {a.credential_source || '—'}
+                      </Badge>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Badge
+                        tone={a.region === 'global' ? 'amber' : 'slate'}
+                        title={
+                          a.region === 'global'
+                            ? '国际版账号：授权页 qoder.com、轮询与签到 openapi.qoder.sh'
+                            : '国内版账号：授权页 qoder.cn、轮询与签到 openapi.qoder.com.cn'
+                        }
+                      >
+                        {a.region === 'global' ? '国际版' : '国内版'}
                       </Badge>
                     </td>
                     <td className="px-4 py-3"><TokenBadge a={a} /></td>

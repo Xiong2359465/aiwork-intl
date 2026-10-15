@@ -319,6 +319,11 @@ fn merge_account(pool: &mut Vec<QoderAccount>, a: &Value) -> MergeResult {
         if !parsed.credential_source.is_empty() {
             x.credential_source = parsed.credential_source.clone();
         }
+        // 区域以导入文件为准：它决定该账号所有出站域名，本地若停在默认国内域，
+        // 国际版账号只会持续 401
+        if !parsed.region.is_empty() {
+            x.region = parsed.region.clone();
+        }
         if parsed.token_expires_at.is_some() {
             x.token_expires_at = parsed.token_expires_at;
         }

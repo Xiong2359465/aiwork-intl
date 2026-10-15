@@ -1441,6 +1441,8 @@ export interface QoderAccountView {
   plan: string;
   /** 凭证来源：pat | ide_store | qoderwork_store | mitm | cli */
   credential_source: string;
+  /** 站点区域："" | "cn" → 国内版（qoder.cn / openapi.qoder.com.cn），"global" → 国际版（qoder.com / openapi.qoder.sh） */
+  region: string;
   token_expires_at: number | null;
   needs_relogin: boolean;
   relogin_reason: string;

@@ -33,6 +33,32 @@ pub const OPEN_API_BASE: &str = "https://openapi.qoder.com.cn";
 /// 端点在此域，Bearer 鉴权与 openapi 同源；openapi 主机无该路由——实测 alb 503）
 pub const WEB_BASE: &str = "https://qoder.cn";
 
+/// OpenAPI 基址（国际版/Global 域）。国内与国际是两套独立站点与账号体系，
+/// 端点路径一致、主机不同：`openapi.qoder.sh` ↔ `openapi.qoder.com.cn`。
+pub const OPEN_API_BASE_GLOBAL: &str = "https://openapi.qoder.sh";
+
+/// 官网 Web 域（国际版）：`qoder.com` ↔ 国内 `qoder.cn`
+pub const WEB_BASE_GLOBAL: &str = "https://qoder.com";
+
+/// 按账号 region 选 OpenAPI 基址。空串与 "cn" 都走国内域——存量账号数据没有
+/// region 字段（serde default 为空），以此保证行为与升级前完全一致。
+pub fn openapi_base(region: &str) -> &'static str {
+    if region == "global" {
+        OPEN_API_BASE_GLOBAL
+    } else {
+        OPEN_API_BASE
+    }
+}
+
+/// 按账号 region 选官网 Web 域（口径同 [`openapi_base`]）
+pub fn web_base(region: &str) -> &'static str {
+    if region == "global" {
+        WEB_BASE_GLOBAL
+    } else {
+        WEB_BASE
+    }
+}
+
 /// `Cosy-ClientType` 真实值（R-4 已闭合：2026-09-27 抓包实测主进程恒带 `cosy-clienttype: 10`）
 pub const COSY_CLIENT_TYPE: &str = "10";
 
@@ -70,6 +96,11 @@ pub struct QoderCreds {
     /// 原始 PAT 供到期重换（PAT 长期有效，绝不入日志/事件）
     #[serde(default)]
     pub pat: String,
+    /// 站点区域："" | "cn" → 国内域（openapi.qoder.com.cn / qoder.cn），
+    /// "global" → 国际域（openapi.qoder.sh / qoder.com）。两区账号体系互不
+    /// 通（同一 dt- 令牌在另一区恒 401 TOKEN_INVALID），所以区域必须随凭证走
+    #[serde(default)]
+    pub region: String,
     /// 刷新令牌过期时刻（ms；R-10 设备流 refresh_token_expires_in ≈360d、R-6 jobToken
     /// ≈48h）。审查 L-RT 过期持久化：落库留档，供后续 RT 生命周期判定消费
     #[serde(default)]
@@ -80,6 +111,12 @@ pub struct QoderCreds {
     pub machine_id: String,
     #[serde(default)]
     pub machine_token: String,
+    /// 国际版账号绑定的派生键（region=global 时由 device_profile 盐派生写入；
+    /// 国内版留空，走原有 machine_id 截断兜底）
+    #[serde(default)]
+    pub machine_code: String,
+    #[serde(default)]
+    pub machine_type: String,
 }
 
 // 手写脱敏 Debug（derive(Debug) 会把 access_token/refresh_token/pat/machine_token
@@ -94,6 +131,7 @@ impl std::fmt::Debug for QoderCreds {
             .field("uid", &self.uid)
             .field("nickname", &self.nickname)
             .field("kind", &self.kind)
+            .field("region", &self.region)
             .field("pat", &mask(&self.pat))
             .field("refresh_expires_at_ms", &self.refresh_expires_at_ms)
             .field("machine_id", &self.machine_id)
@@ -142,6 +180,7 @@ pub fn creds_of(source: &Value) -> QoderCreds {
         nickname: s_of(fs_utils::dig(account, &["nickname", "name", "displayName"])),
         kind: s_of(fs_utils::dig(auth, &["kind", "token_kind", "credential_source"])),
         pat: s_of(fs_utils::dig(source, &["pat"])),
+        region: s_of(fs_utils::dig(source, &["region"])),
         refresh_expires_at_ms: i_of(fs_utils::dig(
             source,
             &["refresh_expires_at_ms", "refreshExpiresAtMs", "refresh_expires_at", "refreshExpiresAt"],
@@ -149,6 +188,8 @@ pub fn creds_of(source: &Value) -> QoderCreds {
         .and_then(clamp_expires_at),
         machine_id: s_of(fs_utils::dig(source, &["machine_id", "machineId", "cosy_machine_id"])),
         machine_token: s_of(fs_utils::dig(source, &["machine_token", "machineToken", "cosy_machine_token"])),
+        machine_code: s_of(fs_utils::dig(source, &["machine_code", "machineCode", "cosy_machine_code"])),
+        machine_type: s_of(fs_utils::dig(source, &["machine_type", "machineType", "cosy_machine_type"])),
     }
 }
 
@@ -309,7 +350,39 @@ pub fn effective_creds(state: &AppState, acct_id: &str) -> QoderCreds {
         .unwrap_or_default();
     let profile = load_device_profile(state, acct_id);
     super::qoder_device::merge_device_profile(&mut creds, profile.as_ref());
+    // 区域回填：token store 的旧形态没有 region，账号池里有——以账号池为准，
+    // 否则国际版账号会被当成国内域请求（跨区恒 401 TOKEN_INVALID）
+    if creds.region.is_empty() {
+        creds.region = account_region(state, acct_id);
+    }
+    // 国际版：设备标识按账号派生（device_profile.machine_id 充当该账号自持私有盐）。
+    // 不用本机原生三键覆盖——那会让同机多账号对外表现为同一台物理设备，正是
+    // 多开要避免的跨账号关联面；派生值同账号恒定、跨账号互不相同
+    if creds.region == "global" {
+        if let Some(p) = profile.as_ref().filter(|p| !p.machine_id.is_empty()) {
+            let d = super::qoder_device::derive_device_identity(p, &creds.uid, &creds.access_token);
+            creds.machine_id = d.machine_id;
+            creds.machine_token = d.machine_token;
+            creds.machine_code = d.machine_code;
+            creds.machine_type = d.machine_type;
+        }
+    }
     creds
+}
+
+/// 从账号池读取账号站点区域；缺失返回空串（语义 = 国内域，与升级前一致）
+fn account_region(state: &AppState, acct_id: &str) -> String {
+    let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+    pool.get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|a| a.get("id").and_then(Value::as_str) == Some(acct_id))
+        })
+        .and_then(|a| a.get("region"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// 从账号池读取账号绑定指纹（§5.10；缺失返回 None → 不注入）
@@ -608,8 +681,18 @@ fn extend_device_headers_with(
         Some(n) => apply_native_risk_headers(h, n),
         None => {
             if !creds.machine_id.is_empty() {
-                let code: String = creds.machine_id.chars().take(18).collect();
-                let mtype: String = creds.machine_id.chars().take(17).collect();
+                // 国际版走账号派生四键（creds 已带 code/type）；国内版无派生值时
+                // 仍按 machine_id 截断兜底，形态与升级前一致
+                let code = if creds.machine_code.is_empty() {
+                    creds.machine_id.chars().take(18).collect::<String>()
+                } else {
+                    creds.machine_code.clone()
+                };
+                let mtype = if creds.machine_type.is_empty() {
+                    creds.machine_id.chars().take(17).collect::<String>()
+                } else {
+                    creds.machine_type.clone()
+                };
                 if !has(h, "Cosy-MachineCode") {
                     h.push(("Cosy-MachineCode".to_string(), code));
                 }
@@ -624,7 +707,14 @@ fn extend_device_headers_with(
 /// 见 [`extend_device_headers_with`]：真值经 [`resolve_native_risk_identity`]
 /// 解析并缓存，调用开销≈0
 pub fn extend_client_device_headers(h: &mut Vec<(String, String)>, creds: &QoderCreds) {
-    extend_device_headers_with(h, creds, resolve_native_risk_identity());
+    // 国际版恒走账号派生标识：本机客户端原生三键属于「一机一身份」，
+    // 用它会把同机多个国际版账号折叠成同一台设备
+    let native = if creds.region == "global" {
+        None
+    } else {
+        resolve_native_risk_identity()
+    };
+    extend_device_headers_with(h, creds, native);
 }
 
 /// Bearer + Cosy-ClientType（缺失 → 服务端静默空列表）+ 可选设备头透传 + UA，
@@ -641,6 +731,13 @@ pub fn build_auth_headers(creds: &QoderCreds) -> Vec<(String, String)> {
         ("User-Agent".to_string(), CLIENT_USER_AGENT.to_string()),
         ("Content-Type".to_string(), "application/json".to_string()),
     ];
+    // 国际版管理面请求（userinfo / plan / usage / campaigns）只带必要头：实测这些
+    // 端点仅需 Authorization + clienttype 即可，而携带自造 cosy-machine* 三键本身
+    // 就是一个「非真机」信号。账号级设备标识仍算好留在 creds 里，供本地状态覆写与
+    // 网关推理链路使用（那里必须带、且必须一账号一设备）
+    if creds.region == "global" {
+        return h;
+    }
     // 设备指纹头原样携带（注入发生在 effective_creds 合并层，§5.10）
     if !creds.machine_id.is_empty() {
         h.push(("Cosy-MachineId".to_string(), creds.machine_id.clone()));
@@ -735,7 +832,11 @@ pub fn refresh_token_once_ex(
     // 刷新端点不带 Authorization（下方 retain 移除；鉴权完全靠 body 中的 refresh_token）+ Cosy 头
     let mut h = build_auth_headers(creds);
     h.retain(|(k, _)| k != "Authorization");
-    let url = format!("{OPEN_API_BASE}{}", refresh_endpoint_for(&creds.refresh_token));
+    let url = format!(
+        "{}{}",
+        openapi_base(&creds.region),
+        refresh_endpoint_for(&creds.refresh_token)
+    );
     let (status, body) = post_json(
         agent,
         &url,
@@ -789,11 +890,28 @@ pub fn refresh_token_once_ex(
 /// （R-13 侦察注：设计文档 L553 写 GET，但实现一直以 POST 在用且未被证伪——
 /// 端点真实方法未实测，若后续发现 404/405 再切 get_json。）
 pub fn fetch_userinfo(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>) {
-    let url = format!("{OPEN_API_BASE}/api/v1/userinfo");
-    let (status, body) = post_json(agent, &url, &build_auth_headers(creds), &serde_json::json!({}));
-    if status != 200 {
-        return (None, None);
-    }
+    let url = format!("{}/api/v1/userinfo", openapi_base(&creds.region));
+    // GET 优先：国际版实测 POST 该端点 404 {"errorCode":"NotFound"}，GET 才通
+    // （2026-10-16 用活令牌复核）。国内版历史上一直 POST 且可用，故 GET 非 200
+    // 时回落 POST，保持存量行为不被证伪
+    let (st_get, body_get, _raw_get) = get_json(agent, &url, &build_auth_headers(creds));
+    let body = if st_get == 200 {
+        body_get
+    } else {
+        let (s2, b2) = post_json(agent, &url, &build_auth_headers(creds), &serde_json::json!({}));
+        if s2 != 200 {
+            // 两通道都失败才报失败，并带上两个状态码：404 = 端点方法/路径变了，
+            // 401 = 令牌失效，排查时不必再靠猜
+            crate::fs_utils::app_log_default(&format!(
+                "qoder userinfo 取数失败 region={} GET={} POST={}",
+                if creds.region.is_empty() { "cn" } else { &creds.region },
+                st_get,
+                s2
+            ));
+            return (None, None);
+        }
+        b2
+    };
     let Some(b) = body else { return (None, None) };
     // 信封穿透：{data:{uid,nickname}} 或平铺
     let uid = fs_utils::dig(&b, &["uid", "userId", "user_id", "id"]).and_then(Value::as_str).map(String::from);
@@ -846,7 +964,7 @@ pub fn need_plan_fetch(row_ok: bool, stored_plan: &str) -> bool {
 /// 实测响应：{"user_type":"personal_professional_trial","plan_tier_name":"Pro Trial",
 ///           "is_personal_version":true,"is_paid_plan":false,...,"end_date":1791673619906}
 pub fn fetch_plan(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>, Option<i64>) {
-    let url = format!("{OPEN_API_BASE}/api/v2/user/plan");
+    let url = format!("{}/api/v2/user/plan", openapi_base(&creds.region));
     let (status, body, _raw) = get_json(agent, &url, &build_auth_headers(creds));
     if status != 200 {
         return (None, None, None);
@@ -944,6 +1062,17 @@ pub fn exchange_job_token(
     pat: &str,
     data_dir: &std::path::Path,
 ) -> Result<QoderCreds, JobExchangeFail> {
+    exchange_job_token_in(agent, pat, data_dir, "")
+}
+
+/// 区域版 PAT→作业令牌交换。两区 PAT 由各自站点签发（国内 qoder.cn、国际
+/// qoder.com 的 /account/integrations），跨区打换取端点恒 401，故 region 需显式传入。
+pub fn exchange_job_token_in(
+    agent: &ureq::Agent,
+    pat: &str,
+    data_dir: &std::path::Path,
+    region: &str,
+) -> Result<QoderCreds, JobExchangeFail> {
     let attempts = job_token_attempts(pat);
     // 首通道（已证实 R-6 路径）状态码决定失败分类；None = 首通道未产生 HTTP 状态
     //（理论不可达——attempts 非空），按暂态兜底保守处理
@@ -951,7 +1080,7 @@ pub fn exchange_job_token(
     for (i, (path, body, tag)) in attempts.iter().enumerate() {
         let path = *path;
         let tag = *tag;
-        let url = format!("{OPEN_API_BASE}{path}");
+        let url = format!("{}{}", openapi_base(region), path);
         let headers = vec![
             ("Authorization".to_string(), format!("Bearer {pat}")),
             ("Cosy-ClientType".to_string(), COSY_CLIENT_TYPE.to_string()),
@@ -981,6 +1110,7 @@ pub fn exchange_job_token(
                         expires_at_ms,
                         kind: "pat".into(),
                         pat: pat.to_string(),
+                        region: region.to_string(),
                         ..Default::default()
                     });
                 }
@@ -1080,7 +1210,7 @@ pub fn ensure_fresh(
         } else {
             creds.pat.clone()
         };
-        return match exchange_job_token(agent, &pat, &state.data_dir) {
+        return match exchange_job_token_in(agent, &pat, &state.data_dir, &creds.region) {
             Ok(new) => {
                 // 落库失败不能静默：否则新作业令牌只存活本轮，下轮仍走 PAT 重换
                 if let Err(e) = save_token_store(state, acct_id, &new) {
